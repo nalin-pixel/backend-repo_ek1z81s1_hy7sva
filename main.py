@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import hashlib
 from typing import List, Optional
 
@@ -9,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-from database import db, create_document
+from database import db
 
 app = FastAPI()
 
@@ -24,7 +25,7 @@ app.add_middleware(
 OSM_NOMINATIM = "https://nominatim.openstreetmap.org/search"
 OSM_OVERPASS = "https://overpass-api.de/api/interpreter"
 UA = {
-    "User-Agent": "Flames-LeadGen/1.0 (https://flames.blue; contact support@flames.blue)",
+    "User-Agent": "Flames-LeadGen/1.1 (+https://flames.blue; contact support@flames.blue)",
 }
 
 
@@ -32,6 +33,10 @@ class LeadRequest(BaseModel):
     niche: str = Field(..., description="Niche or industry, e.g., plumbers")
     area: str = Field(..., description="City/region/country to search, e.g., Austin, TX")
     limit: int = Field(10, ge=1, le=100, description="How many leads to collect")
+    require_email: bool = Field(False, description="Only include leads with an email")
+    require_website: bool = Field(False, description="Only include leads with a website")
+    require_phone: bool = Field(False, description="Only include leads with a phone number")
+    global_dedupe: bool = Field(False, description="Avoid repeats across all searches (not just niche+area)")
 
 
 class Lead(BaseModel):
@@ -116,9 +121,9 @@ def _extract_emails_from_html(html: str) -> List[str]:
     return list(found)
 
 
-def _try_fetch(url: str) -> Optional[str]:
+def _try_fetch(url: str, timeout: int = 8) -> Optional[str]:
     try:
-        r = requests.get(url, headers=UA, timeout=8)
+        r = requests.get(url, headers=UA, timeout=timeout)
         if r.status_code == 200 and r.text:
             return r.text
     except Exception:
@@ -126,13 +131,34 @@ def _try_fetch(url: str) -> Optional[str]:
     return None
 
 
+CONTACT_PATHS = [
+    "/contact",
+    "/contact/",
+    "/contact-us",
+    "/contact-us/",
+    "/about",
+    "/about/",
+    "/about-us",
+    "/about-us/",
+    "/impressum",
+    "/impressum/",
+    "/kontakt",
+    "/kontakt/",
+    "/contacto",
+    "/contacto/",
+    "/contacts",
+    "/contacts/",
+    "/empresa",
+    "/empresa/",
+]
+
+
 def discover_email(website: Optional[str]) -> Optional[str]:
     site = _normalize_url(website) if website else None
     candidates = []
     if site:
         candidates.append(site)
-        # Try common contact paths
-        for path in ["/contact", "/contact-us", "/about", "/impressum"]:
+        for path in CONTACT_PATHS:
             candidates.append(site.rstrip("/") + path)
 
     for u in candidates:
@@ -142,12 +168,32 @@ def discover_email(website: Optional[str]) -> Optional[str]:
         emails = _extract_emails_from_html(html)
         if emails:
             return emails[0]
+        # be polite to servers
+        time.sleep(0.3)
     return None
+
+
+def _request_with_retries(method: str, url: str, *, params=None, data=None, timeout=15, retries=2, backoff=0.8):
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            if method == "GET":
+                r = requests.get(url, params=params, headers=UA, timeout=timeout)
+            else:
+                r = requests.post(url, data=data, headers=UA, timeout=timeout)
+            if r.status_code == 200:
+                return r
+        except Exception as e:
+            last_exc = e
+        time.sleep(backoff * (attempt + 1))
+    if last_exc:
+        raise last_exc
+    raise HTTPException(status_code=502, detail="External service error")
 
 
 def geocode_area(area: str):
     params = {"q": area, "format": "json", "limit": 1}
-    r = requests.get(OSM_NOMINATIM, params=params, headers=UA, timeout=10)
+    r = _request_with_retries("GET", OSM_NOMINATIM, params=params, timeout=12)
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail="Geocoding service error")
     data = r.json()
@@ -160,7 +206,6 @@ def geocode_area(area: str):
 
 def overpass_search(niche: str, bbox, max_results: int) -> List[dict]:
     south, north, west, east = bbox
-    # Build Overpass QL: search for nodes/ways/relations with name or business tag matching niche
     niche_regex = niche.replace("\"", " ")
     query = f"""
     [out:json][timeout:25];
@@ -174,14 +219,24 @@ def overpass_search(niche: str, bbox, max_results: int) -> List[dict]:
     );
     out tags {max_results};
     """
-    r = requests.post(OSM_OVERPASS, data=query.encode("utf-8"), headers=UA, timeout=30)
+    r = _request_with_retries("POST", OSM_OVERPASS, data=query.encode("utf-8"), timeout=30)
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail="Overpass service error")
     data = r.json()
-    return data.get("elements", [])[: max_results * 3]  # extra to allow filtering
+    return data.get("elements", [])[: max_results * 3]
 
 
-def build_leads(niche: str, area: str, limit: int, mark_served: bool = True) -> List[Lead]:
+def build_leads(
+    niche: str,
+    area: str,
+    limit: int,
+    *,
+    require_email: bool = False,
+    require_website: bool = False,
+    require_phone: bool = False,
+    global_dedupe: bool = False,
+    mark_served: bool = True,
+) -> List[Lead]:
     if db is None:
         raise HTTPException(status_code=500, detail="Database not configured")
 
@@ -215,12 +270,24 @@ def build_leads(niche: str, area: str, limit: int, mark_served: bool = True) -> 
         osm_id = str(el.get("id"))
         unique_key = _hash_key(name, website, osm_id)
 
-        # Skip already served for this niche/area
-        if served_coll.find_one({"niche": niche.lower(), "area": area.lower(), "unique_key": unique_key}):
+        # Check served: scoped or global
+        if global_dedupe:
+            served_query = {"unique_key": unique_key, "global": True}
+        else:
+            served_query = {"niche": niche.lower(), "area": area.lower(), "unique_key": unique_key, "global": {"$ne": True}}
+        if served_coll.find_one(served_query):
             continue
 
         if not email:
             email = discover_email(website)
+
+        # Apply filters
+        if require_email and not email:
+            continue
+        if require_website and not website:
+            continue
+        if require_phone and not phone:
+            continue
 
         lead_doc = {
             "niche": niche,
@@ -235,18 +302,28 @@ def build_leads(niche: str, area: str, limit: int, mark_served: bool = True) -> 
         }
 
         # Persist lead (upsert on unique combination)
-        leads_coll.update_one(
-            {"osm_id": osm_id, "niche": niche, "area": area},
-            {"$set": lead_doc, "$setOnInsert": {"created_at": requests.utils.datetime.datetime.utcnow()}},
-            upsert=True,
-        )
-
-        if mark_served:
-            served_coll.update_one(
-                {"niche": niche.lower(), "area": area.lower(), "unique_key": unique_key},
-                {"$set": {"niche": niche.lower(), "area": area.lower(), "unique_key": unique_key}},
+        try:
+            leads_coll.update_one(
+                {"osm_id": osm_id, "niche": niche, "area": area},
+                {"$set": lead_doc, "$setOnInsert": {"created_at": requests.utils.datetime.datetime.utcnow()}},
                 upsert=True,
             )
+        except Exception:
+            # Non-fatal: continue even if persistence fails
+            pass
+
+        if mark_served:
+            served_doc = {"unique_key": unique_key}
+            if global_dedupe:
+                served_doc.update({"global": True})
+                served_coll.update_one({"unique_key": unique_key, "global": True}, {"$set": served_doc}, upsert=True)
+            else:
+                served_doc.update({"niche": niche.lower(), "area": area.lower(), "global": False})
+                served_coll.update_one(
+                    {"niche": niche.lower(), "area": area.lower(), "unique_key": unique_key, "global": False},
+                    {"$set": served_doc},
+                    upsert=True,
+                )
 
         results.append(Lead(**lead_doc))
         if len(results) >= limit:
@@ -258,7 +335,16 @@ def build_leads(niche: str, area: str, limit: int, mark_served: bool = True) -> 
 @app.post("/api/leads/search", response_model=List[Lead])
 def search_leads(req: LeadRequest):
     try:
-        return build_leads(req.niche.strip(), req.area.strip(), req.limit, mark_served=True)
+        return build_leads(
+            req.niche.strip(),
+            req.area.strip(),
+            req.limit,
+            require_email=req.require_email,
+            require_website=req.require_website,
+            require_phone=req.require_phone,
+            global_dedupe=req.global_dedupe,
+            mark_served=True,
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -270,28 +356,44 @@ def export_leads(
     niche: str = Query(...),
     area: str = Query(...),
     limit: int = Query(10, ge=1, le=100),
+    require_email: bool = Query(False),
+    require_website: bool = Query(False),
+    require_phone: bool = Query(False),
+    global_dedupe: bool = Query(False),
 ):
-    leads = build_leads(niche.strip(), area.strip(), limit, mark_served=True)
+    leads = build_leads(
+        niche.strip(),
+        area.strip(),
+        limit,
+        require_email=require_email,
+        require_website=require_website,
+        require_phone=require_phone,
+        global_dedupe=global_dedupe,
+        mark_served=True,
+    )
     # Build CSV
     headers = ["niche", "area", "name", "email", "phone", "website", "address", "source", "osm_id"]
     lines = [",".join(headers)]
+
     def esc(val: Optional[str]) -> str:
         if val is None:
             return ""
         s = str(val).replace('"', '""')
-        # wrap in quotes if contains comma or newline
         if "," in s or "\n" in s:
             return f'"{s}"'
         return s
+
     for lead in leads:
         row = [esc(getattr(lead, h)) for h in headers]
         lines.append(",".join(row))
 
     csv_text = "\n".join(lines)
+    safe_niche = re.sub(r"[^A-Za-z0-9_-]+", "_", niche.strip())
+    safe_area = re.sub(r"[^A-Za-z0-9_-]+", "_", area.strip())
     return PlainTextResponse(
         content=csv_text,
         headers={
-            "Content-Disposition": f"attachment; filename=leads_{niche}_{area}.csv",
+            "Content-Disposition": f"attachment; filename=leads_{safe_niche}_{safe_area}.csv",
             "Content-Type": "text/csv; charset=utf-8",
         },
     )
